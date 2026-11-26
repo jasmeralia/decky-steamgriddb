@@ -37,6 +37,9 @@ PAGE_HOOK = r'''(() => {
   let activeAppId = 0;
   let activeMenuComponent = null;
   let frontendToken = null;
+  let frontendReady = false;
+  let pendingNavigationAppId = 0;
+  let pendingNavigationTimer = 0;
   let insertionTimer = 0;
   let disposed = false;
   const retryTimers = new Set();
@@ -70,6 +73,31 @@ PAGE_HOOK = r'''(() => {
   const isArtworkElement = (element) => element?.key === "sgdb-change-artwork" ||
     element?.props?.className?.includes("sgdb-change-artwork");
 
+  const navigateToApp = (appId) => {
+    if (disposed) return;
+    if (frontendReady && frontendToken) {
+      channel.postMessage({ type: "navigate", appId, token: frontendToken });
+      return;
+    }
+
+    pendingNavigationAppId = appId;
+    window.clearTimeout(pendingNavigationTimer);
+    pendingNavigationTimer = window.setTimeout(() => {
+      pendingNavigationAppId = 0;
+      pendingNavigationTimer = 0;
+    }, 5000);
+    requestRegistration();
+  };
+
+  const sendPendingNavigation = () => {
+    if (!pendingNavigationAppId || !frontendReady || !frontendToken) return;
+    const appId = pendingNavigationAppId;
+    pendingNavigationAppId = 0;
+    window.clearTimeout(pendingNavigationTimer);
+    pendingNavigationTimer = 0;
+    channel.postMessage({ type: "navigate", appId, token: frontendToken });
+  };
+
   const makeArtworkElement = (propertiesElement, appId) => ({
     ...propertiesElement,
     key: "sgdb-change-artwork",
@@ -77,11 +105,7 @@ PAGE_HOOK = r'''(() => {
     props: {
       ...propertiesElement.props,
       className: `${propertiesElement.props.className || ""} sgdb-change-artwork`.trim(),
-      onSelected: () => {
-        if (!disposed && frontendToken) {
-          channel.postMessage({ type: "navigate", appId, token: frontendToken });
-        }
-      },
+      onSelected: () => navigateToApp(appId),
       children: menuLabel,
     },
   });
@@ -139,7 +163,7 @@ PAGE_HOOK = r'''(() => {
       const wrappedRender = function (...args) {
         const result = originalRender.apply(this, args);
         const appId = this.props?.overview?.appid;
-        if (!appId || !frontendToken) return result;
+        if (!appId) return result;
         try {
           return injectIntoGameActionRender(result, appId);
         } catch (error) {
@@ -159,14 +183,6 @@ PAGE_HOOK = r'''(() => {
   const tryPatchGameActionComponent = (appId, remaining = 60) => {
     if (disposed || remaining <= 0) return;
     activeAppId = appId;
-    if (!frontendToken) {
-      const timer = window.setTimeout(() => {
-        retryTimers.delete(timer);
-        tryPatchGameActionComponent(appId, remaining - 1);
-      }, 50);
-      retryTimers.add(timer);
-      return;
-    }
     const menu = [...document.querySelectorAll('[role="menu"]')].find((candidate) =>
       [...candidate.querySelectorAll('[role="menuitem"]')].some((item) =>
         typeof getReactProps(item)?.onClick === "function"
@@ -227,22 +243,28 @@ PAGE_HOOK = r'''(() => {
     const message = event.data || {};
     if (message.type === "label" && typeof message.label === "string" && message.label.length < 100) {
       if (message.token !== frontendToken) return;
+      frontendReady = true;
       menuLabel = message.label;
       activeMenuComponent?.forceUpdate?.();
+      window.clearTimeout(registrationTimer);
+      sendPendingNavigation();
     } else if (message.type === "register" && typeof message.token === "string" && message.token.length < 100) {
       frontendToken = message.token;
+      frontendReady = false;
       channel.postMessage({ type: "registered", token: frontendToken });
       activeMenuComponent?.forceUpdate?.();
     } else if (message.type === "unregister" && message.token === frontendToken) {
       frontendToken = null;
+      frontendReady = false;
       activeMenuComponent?.forceUpdate?.();
       requestRegistration();
     }
   };
 
   const requestRegistration = () => {
-    if (disposed || frontendToken) return;
+    if (disposed || frontendReady) return;
     channel.postMessage({ type: "request-register" });
+    window.clearTimeout(registrationTimer);
     registrationTimer = window.setTimeout(requestRegistration, 1000);
   };
   let registrationTimer = 0;
@@ -256,6 +278,8 @@ PAGE_HOOK = r'''(() => {
       channel.removeEventListener("message", onChannelMessage);
       window.clearTimeout(insertionTimer);
       window.clearTimeout(registrationTimer);
+      window.clearTimeout(pendingNavigationTimer);
+      pendingNavigationAppId = 0;
       for (const timer of retryTimers) window.clearTimeout(timer);
       retryTimers.clear();
       for (const [node, patch] of wrappedTileProps) {
