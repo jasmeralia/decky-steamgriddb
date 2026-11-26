@@ -41,8 +41,13 @@ PAGE_HOOK = r'''(() => {
   let pendingNavigationAppId = 0;
   let pendingNavigationTimer = 0;
   let insertionTimer = 0;
+  let menuObserver = null;
+  let menuObserverTimeout = 0;
+  let menuObserverCheck = 0;
+  let menuPatchRetry = 0;
+  let menuPatchRetryCount = 0;
+  let observedMenu = null;
   let disposed = false;
-  const retryTimers = new Set();
   const wrappedTileProps = new Map();
   const patchedClasses = new Map();
 
@@ -180,20 +185,65 @@ PAGE_HOOK = r'''(() => {
     return false;
   };
 
-  const tryPatchGameActionComponent = (appId, remaining = 60) => {
-    if (disposed || remaining <= 0) return;
+  const stopMenuObservation = () => {
+    menuObserver?.disconnect();
+    menuObserver = null;
+    window.clearTimeout(menuObserverTimeout);
+    menuObserverTimeout = 0;
+    window.clearTimeout(menuObserverCheck);
+    menuObserverCheck = 0;
+    window.clearTimeout(menuPatchRetry);
+    menuPatchRetry = 0;
+    menuPatchRetryCount = 0;
+    observedMenu = null;
+  };
+
+  const tryPatchGameActionComponent = (appId) => {
+    if (disposed) return;
     activeAppId = appId;
+    if (observedMenu && !document.contains(observedMenu)) {
+      stopMenuObservation();
+      return;
+    }
     const menu = [...document.querySelectorAll('[role="menu"]')].find((candidate) =>
       [...candidate.querySelectorAll('[role="menuitem"]')].some((item) =>
         typeof getReactProps(item)?.onClick === "function"
       )
     );
-    if (menu && patchGameActionComponent(menu)) return;
-    const timer = window.setTimeout(() => {
-      retryTimers.delete(timer);
-      tryPatchGameActionComponent(appId, remaining - 1);
+    if (menu) {
+      observedMenu = menu;
+      if (patchGameActionComponent(menu)) {
+        stopMenuObservation();
+        return;
+      }
+    }
+    if (menuPatchRetry || menuPatchRetryCount >= 60) return;
+    menuPatchRetryCount += 1;
+    menuPatchRetry = window.setTimeout(() => {
+      menuPatchRetry = 0;
+      tryPatchGameActionComponent(appId);
     }, 50);
-    retryTimers.add(timer);
+  };
+
+  const watchForGameActionMenu = (appId) => {
+    stopMenuObservation();
+    activeAppId = appId;
+    menuObserver = new MutationObserver(() => {
+      if (observedMenu && !document.contains(observedMenu)) {
+        stopMenuObservation();
+        return;
+      }
+      if (menuObserverCheck) return;
+      menuObserverCheck = window.setTimeout(() => {
+        menuObserverCheck = 0;
+        tryPatchGameActionComponent(activeAppId);
+      }, 0);
+    });
+    if (document.documentElement) {
+      menuObserver.observe(document.documentElement, { childList: true, subtree: true });
+    }
+    menuObserverTimeout = window.setTimeout(stopMenuObservation, 3000);
+    tryPatchGameActionComponent(appId);
   };
 
   const isGameArtworkHandler = (handler) => {
@@ -220,11 +270,9 @@ PAGE_HOOK = r'''(() => {
         const wrapped = function (...args) {
           if (disposed) return handler.apply(this, args);
           activeAppId = appId;
-          for (const timer of retryTimers) window.clearTimeout(timer);
-          retryTimers.clear();
           const result = handler.apply(this, args);
           window.clearTimeout(insertionTimer);
-          insertionTimer = window.setTimeout(() => tryPatchGameActionComponent(appId), 0);
+          insertionTimer = window.setTimeout(() => watchForGameActionMenu(appId), 0);
           return result;
         };
         wrapped.__sgdbContextMenuWrapped = true;
@@ -279,9 +327,8 @@ PAGE_HOOK = r'''(() => {
       window.clearTimeout(insertionTimer);
       window.clearTimeout(registrationTimer);
       window.clearTimeout(pendingNavigationTimer);
+      stopMenuObservation();
       pendingNavigationAppId = 0;
-      for (const timer of retryTimers) window.clearTimeout(timer);
-      retryTimers.clear();
       for (const [node, patch] of wrappedTileProps) {
         if (node[patch.propsKey] === patch.wrappedProps) node[patch.propsKey] = patch.originalProps;
       }
